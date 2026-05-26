@@ -1,0 +1,62 @@
+# i-am-the-CA-now
+
+> CVE-2026-26151 made RDP annoying again, but you know who you can trust. *use with caution.*
+
+the dialog wanted to know who signed this .rdp file. the dialog now knows.
+
+## the deal
+
+microsoft shipped a security update in april 2026 that makes you click through a yellow consent dialog every time you open a .rdp file. publisher: unknown. redirections all off by default. fine if you're a target of nation-state phishing, kind of fucking annoying if you're just trying to log into your hosted environment for the 400th time this month.
+
+the fix microsoft wants you to do: get a code-signing cert from your enterprise PKI, sign your .rdp files, push the thumbprint via GPO.
+
+cool. great. love that for them.
+
+the fix for the rest of us: become your own PKI. it's one machine. who's gonna stop you.
+
+## what it does
+
+- generates a self-signed code-signing cert; `CN=RDP-Signing-<hostname>`, lives in the local machine store
+- imports it into `LocalMachine\Root` so the chain validates
+- imports it into `LocalMachine\TrustedPublisher` so authenticode trusts signatures from it
+- enables the `AllowSignedFiles` policy and adds the thumbprint to `TrustedCertThumbprints`
+- sets `RdpLaunchConsentAccepted` so the educational first-launch dialog doesn't ambush you
+- signs every .rdp on your desktop with `rdpsign.exe /sha256`
+- idempotent; safe to re-run when mstsc inevitably overwrites a signature
+
+you are now a root CA on this machine. that's the trade.
+
+if that sentence makes you uncomfortable, it should. the lower-power option is the registry revert at the bottom of [microsoft's own doc](https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/remotepc/understanding-security-warnings); flip `RedirectionWarningDialogVersion` to `1` and you get the pre-april behavior back, no cert shenanigans. microsoft has also said they might yank that switch in a future update, so... pick your poison.
+
+## usage
+
+right-click → run with powershell. or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Sign-MyRDPs.ps1
+```
+
+it'll UAC-prompt itself if you forgot to elevate.
+
+## when it stops working
+
+mstsc rewrites .rdp files when you connect; that invalidates the signature. if the yellow dialog comes back, just re-run the script. takes two seconds. or rename your .rdp to something other than `Default.rdp` and mark it read-only:
+
+```powershell
+Set-ItemProperty .\myconnection.rdp -Name IsReadOnly -Value $true
+```
+
+mstsc will complain it can't save settings. that's the point.
+
+## things this is not
+
+- not a substitute for actual enterprise PKI; if you have ADCS, use that instead
+- not portable across machines; each box generates its own cert under its own hostname (this is on purpose; the private key stays local)
+- not signed itself; if your execution policy is set to restricted you'll need `-ExecutionPolicy Bypass` or to sign it yourself (...with the cert you just made, if you wanna get cute about it)
+- not endorsed by anyone; especially not microsoft, who would prefer you stand up a CA
+
+## the real fix
+
+if you're getting these .rdp files from a vendor (your hosted desktop provider, your MSP, whoever); ask them to sign their .rdp files. they probably can. they just don't by default because their support tickets haven't caught up to april 14th yet.
+
+until then: i-am-the-CA-now.
