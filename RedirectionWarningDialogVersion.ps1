@@ -1,46 +1,51 @@
 <#
 .SYNOPSIS
-    Reverts the changes made by Sign-DesktopRdpFiles.ps1 / RDPtrustme.ps1 and
-    instead suppresses the post-April-2026 RDP warning (CVE-2026-26151) via the
-    lower-power registry switch RedirectionWarningDialogVersion = 1.
+    Reverts the self-signed RDP CA deployment (RDPtrustme.ps1 / Sign-MyRDPs.ps1)
+    and ensures the April-2026 consolidated security dialog stays ENABLED.
 
 .DESCRIPTION
-    1. Removes the self-signed code-signing cert (CN=RDP Signing - <host> and the
-       older CN=RDP-Signing-<host> variant) from LocalMachine\My, \Root, and
-       \TrustedPublisher.
-    2. Pulls that thumbprint out of the HKLM and HKCU TrustedCertThumbprints
-       policy; removes AllowSignedFiles only if no thumbprints remain.
-    3. Strips the signature: line from .rdp files on the desktop so they revert
-       to plain unsigned files.
-    4. Clears RdpLaunchConsentAccepted for the console user.
-    5. Sets RedirectionWarningDialogVersion = 1 (HKLM + console-user HKCU) to
-       restore pre-April popup behavior without any cert.
+    CORRECTION over the earlier reverter:
+    The earlier script set RedirectionWarningDialogVersion = 1 as a "lighter"
+    fix. That is WRONG. Per the IMsRdpExtendedSettings docs (MsTscAx.dll),
+    version 2 (the April 2026 default) CONSOLIDATES the per-channel warnings and
+    makes WarnAboutClipboardRedirection / WarnAboutSendingCredentials /
+    WarnAboutPrinterRedirection / WarnAboutDirectXRedirection have NO EFFECT.
+    Writing 1 re-enables that deprecated, individually-suppressible warning
+    surface — i.e. it REOPENS the attack surface the update closed.
 
-    Idempotent. Safe to re-run. Self-elevates.
+    This script therefore:
+      1. Removes the self-signed cert from My, Root, TrustedPublisher.
+      2. Prunes our thumbprint from TrustedCertThumbprints (HKLM + HKCU);
+         removes AllowSignedFiles only if no thumbprints remain.
+      3. Clears RdpLaunchConsentAccepted.
+      4. Strips signature/signscope lines from desktop .rdp files.
+      5. FORCES RedirectionWarningDialogVersion = 2 (removing any =1 left by a
+         prior run), so the consolidated dialog stays intact. The popup is the
+         mitigation; let it stand. Brad clicks through. That's correct.
+
+    Idempotent. Self-elevates. Heals a box that ran the bad reverter.
 
 .NOTES
-    Log: $env:TEMP\Undo-RdpSigning.log
+    Log: $env:TEMP\Undo-RdpSigning-Corrected.log
 #>
 
 [CmdletBinding()]
 param(
-    # Match both the pro-script subject and the gist-script subject.
     [string[]]$CertSubjects = @(
         "CN=RDP Signing - $env:COMPUTERNAME",
         "CN=RDP-Signing-$env:COMPUTERNAME"
     ),
-    # If set, leave .rdp files signed and only undo trust + flip the bit.
     [switch]$KeepRdpSignatures
 )
 
 $ErrorActionPreference = 'Stop'
-$LogPath = Join-Path $env:TEMP 'Undo-RdpSigning.log'
+$LogPath = Join-Path $env:TEMP 'Undo-RdpSigning-Corrected.log'
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Add-Content -Path $LogPath -Value $line
-    $color = switch ($Level) { 'ERROR'{'Red'} 'WARN'{'Yellow'} 'OK'{'Green'} 'SKIP'{'DarkGray'} default{'White'} }
+    $color = switch ($Level) { 'ERROR'{'Red'} 'WARN'{'Yellow'} 'OK'{'Green'} 'SKIP'{'DarkGray'} 'CRIT'{'Magenta'} default{'White'} }
     Write-Host $line -ForegroundColor $color
 }
 
@@ -50,50 +55,42 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ----- Self-elevate --------------------------------------------------------
 if (-not (Test-Admin)) {
     Write-Host "Elevating..." -ForegroundColor Yellow
     try {
         Start-Process powershell.exe -Verb RunAs -ArgumentList @(
             '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`""
         )
-    } catch {
-        Write-Host "Elevation cancelled or failed: $_" -ForegroundColor Red
-        exit 2
-    }
+    } catch { Write-Host "Elevation failed: $_" -ForegroundColor Red; exit 2 }
     exit 0
 }
 
 $IsInteractive = [Environment]::UserInteractive -and (-not [Console]::IsInputRedirected)
-Write-Log "=== Undo-RdpSigning starting on $env:COMPUTERNAME as $env:USERNAME ==="
+Write-Log "=== Undo-RdpSigning-Corrected on $env:COMPUTERNAME as $env:USERNAME ==="
 
-# ----- Resolve console user (for HKCU + desktop) ---------------------------
-$ConsoleUser = $null; $UserSID = $null
+# ----- Resolve console user ------------------------------------------------
+$UserSID = $null
 try {
-    $ConsoleUser = (Get-CimInstance Win32_ComputerSystem).UserName
-    if ($ConsoleUser) {
-        $uname = $ConsoleUser.Split('\')[-1]
+    $cu = (Get-CimInstance Win32_ComputerSystem).UserName
+    if ($cu) {
+        $uname = $cu.Split('\')[-1]
         $UserSID = (New-Object System.Security.Principal.NTAccount($uname)
                    ).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        Write-Log "Console user: $ConsoleUser (SID: $UserSID)"
+        Write-Log "Console user: $cu (SID: $UserSID)"
     }
-} catch { Write-Log "Could not resolve console user SID: $_" 'WARN' }
+} catch { Write-Log "Console user SID resolve failed: $_" 'WARN' }
 
-# Collect the thumbprints we are about to remove so we can prune the policy.
 $OurThumbs = @()
 
 try {
-    # ----- Phase 1: Remove certs from all three stores ---------------------
+    # ----- Phase 1: Remove certs ------------------------------------------
     foreach ($storePath in @('Cert:\LocalMachine\My',
                              'Cert:\LocalMachine\Root',
                              'Cert:\LocalMachine\TrustedPublisher')) {
         $storeName = Split-Path $storePath -Leaf
         $matches = Get-ChildItem $storePath -ErrorAction SilentlyContinue |
             Where-Object { $CertSubjects -contains $_.Subject }
-        if (-not $matches) {
-            Write-Log "No matching cert in $storeName." 'SKIP'
-            continue
-        }
+        if (-not $matches) { Write-Log "No matching cert in $storeName." 'SKIP'; continue }
         foreach ($c in $matches) {
             $OurThumbs += $c.Thumbprint.ToUpper()
             Remove-Item -Path (Join-Path $storePath $c.Thumbprint) -Force
@@ -103,49 +100,39 @@ try {
     $OurThumbs = $OurThumbs | Select-Object -Unique
     if ($OurThumbs) { Write-Log "Target thumbprint(s): $($OurThumbs -join ', ')" }
 
-    # ----- Phase 2: Prune TrustedCertThumbprints (HKLM + HKCU) -------------
-    $polValName   = 'TrustedCertThumbprints'
-    $allowValName = 'AllowSignedFiles'
-
+    # ----- Phase 2: Prune TrustedCertThumbprints --------------------------
     function Repair-Policy {
         param([string]$Key, [string]$Label)
         if (-not (Test-Path $Key)) { Write-Log "$Label policy key absent." 'SKIP'; return }
-
-        $existing = (Get-ItemProperty -Path $Key -Name $polValName -ErrorAction SilentlyContinue).$polValName
+        $existing = (Get-ItemProperty -Path $Key -Name 'TrustedCertThumbprints' -ErrorAction SilentlyContinue).TrustedCertThumbprints
         if ($existing) {
-            $remaining = $existing -split '[;,]' |
-                ForEach-Object { $_.Trim().ToUpper() } |
+            $remaining = $existing -split '[;,]' | ForEach-Object { $_.Trim().ToUpper() } |
                 Where-Object { $_ -and ($OurThumbs -notcontains $_) }
             if ($remaining) {
-                Set-ItemProperty -Path $Key -Name $polValName -Value ($remaining -join ';') -Type String -Force
-                Write-Log "$Label : removed our thumbprint, $($remaining.Count) other(s) preserved." 'OK'
+                Set-ItemProperty -Path $Key -Name 'TrustedCertThumbprints' -Value ($remaining -join ';') -Type String -Force
+                Write-Log "$Label : pruned our thumbprint, $($remaining.Count) other(s) kept." 'OK'
             } else {
-                Remove-ItemProperty -Path $Key -Name $polValName -ErrorAction SilentlyContinue
-                Write-Log "$Label : removed TrustedCertThumbprints (was only ours)." 'OK'
-                # Only clear AllowSignedFiles if no thumbprints remain.
-                Remove-ItemProperty -Path $Key -Name $allowValName -ErrorAction SilentlyContinue
-                Write-Log "$Label : removed AllowSignedFiles." 'OK'
+                Remove-ItemProperty -Path $Key -Name 'TrustedCertThumbprints' -ErrorAction SilentlyContinue
+                Remove-ItemProperty -Path $Key -Name 'AllowSignedFiles' -ErrorAction SilentlyContinue
+                Write-Log "$Label : removed TrustedCertThumbprints + AllowSignedFiles (only ours)." 'OK'
             }
-        } else {
-            Write-Log "$Label : no TrustedCertThumbprints value." 'SKIP'
-        }
+        } else { Write-Log "$Label : no TrustedCertThumbprints value." 'SKIP' }
     }
-
     Repair-Policy 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' 'HKLM'
     if ($UserSID) {
         Repair-Policy "Registry::HKEY_USERS\$UserSID\Software\Policies\Microsoft\Windows NT\Terminal Services" 'HKCU'
     }
 
-    # ----- Phase 3: Clear RdpLaunchConsentAccepted -------------------------
+    # ----- Phase 3: Clear RdpLaunchConsentAccepted ------------------------
     if ($UserSID) {
         $clientKey = "Registry::HKEY_USERS\$UserSID\Software\Microsoft\Terminal Server Client"
         if (Test-Path $clientKey) {
             Remove-ItemProperty -Path $clientKey -Name 'RdpLaunchConsentAccepted' -ErrorAction SilentlyContinue
-            Write-Log "Cleared RdpLaunchConsentAccepted for console user." 'OK'
+            Write-Log "Cleared RdpLaunchConsentAccepted." 'OK'
         }
     }
 
-    # ----- Phase 4: Strip signatures from desktop .rdp files ---------------
+    # ----- Phase 4: Strip signatures from desktop .rdp --------------------
     if (-not $KeepRdpSignatures) {
         $Desktop = $null
         if ($UserSID) {
@@ -153,52 +140,51 @@ try {
                 $profilePath = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$UserSID" -ErrorAction SilentlyContinue).ProfileImagePath
                 $usf = "Registry::HKEY_USERS\$UserSID\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
                 $dRaw = (Get-ItemProperty -Path $usf -Name Desktop -ErrorAction SilentlyContinue).Desktop
-                if ($dRaw) {
-                    $Desktop = [System.Environment]::ExpandEnvironmentVariables($dRaw.Replace('%USERPROFILE%', $profilePath))
-                }
-            } catch { Write-Log "Desktop registry resolve failed: $_" 'WARN' }
+                if ($dRaw) { $Desktop = [Environment]::ExpandEnvironmentVariables($dRaw.Replace('%USERPROFILE%', $profilePath)) }
+            } catch { Write-Log "Desktop resolve failed: $_" 'WARN' }
         }
-        if (-not $Desktop -or -not (Test-Path $Desktop)) {
-            $Desktop = [Environment]::GetFolderPath('Desktop')
-        }
+        if (-not $Desktop -or -not (Test-Path $Desktop)) { $Desktop = [Environment]::GetFolderPath('Desktop') }
         Write-Log "Desktop: $Desktop"
-
-        $rdp = @(Get-ChildItem -Path $Desktop -Filter '*.rdp' -File -ErrorAction SilentlyContinue)
-        foreach ($f in $rdp) {
+        foreach ($f in @(Get-ChildItem -Path $Desktop -Filter '*.rdp' -File -ErrorAction SilentlyContinue)) {
             $wasRO = $f.IsReadOnly
             if ($wasRO) { Set-ItemProperty $f.FullName -Name IsReadOnly -Value $false }
             $lines = Get-Content -Path $f.FullName
-            # rdpsign appends signscope:s: and signature:s: lines; drop them.
             $clean = $lines | Where-Object { $_ -notmatch '^(signature|signscope):s:' }
             if ($clean.Count -ne $lines.Count) {
                 Set-Content -Path $f.FullName -Value $clean -Encoding Unicode
                 Write-Log "Stripped signature from $($f.Name)." 'OK'
-            } else {
-                Write-Log "$($f.Name) had no signature lines." 'SKIP'
-            }
+            } else { Write-Log "$($f.Name): no signature lines." 'SKIP' }
             if ($wasRO) { Set-ItemProperty $f.FullName -Name IsReadOnly -Value $true }
         }
-    } else {
-        Write-Log "KeepRdpSignatures set; left .rdp files untouched." 'SKIP'
+    } else { Write-Log "KeepRdpSignatures set; .rdp untouched." 'SKIP' }
+
+    # ----- Phase 5: FORCE RedirectionWarningDialogVersion = 2 -------------
+    # This HEALS any box where the bad reverter set it to 1.
+    # Version 2 = April 2026 consolidated dialog. Leave it. The popup is the fix.
+    function Force-DialogV2 {
+        param([string]$Key, [string]$Label)
+        if (-not (Test-Path $Key)) { Write-Log "$Label TS key absent; nothing set to 1, default (2) applies." 'SKIP'; return }
+        $cur = (Get-ItemProperty -Path $Key -Name 'RedirectionWarningDialogVersion' -ErrorAction SilentlyContinue).RedirectionWarningDialogVersion
+        if ($null -eq $cur) {
+            Write-Log "$Label : value not set; default 2 already in effect." 'OK'
+        } elseif ($cur -eq 1) {
+            # Remove the override entirely so the secure default (2) governs.
+            Remove-ItemProperty -Path $Key -Name 'RedirectionWarningDialogVersion' -ErrorAction SilentlyContinue
+            Write-Log "$Label : found =1 (INSECURE) from prior run; REMOVED it. Default 2 restored." 'CRIT'
+        } else {
+            Remove-ItemProperty -Path $Key -Name 'RedirectionWarningDialogVersion' -ErrorAction SilentlyContinue
+            Write-Log "$Label : cleared explicit value ($cur); default 2 governs." 'OK'
+        }
     }
-
-    # ----- Phase 5: Flip RedirectionWarningDialogVersion = 1 ---------------
-    # Lower-power suppression: restores pre-April popup behavior, no cert.
-    $tsKeyHKLM = 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services'
-    if (-not (Test-Path $tsKeyHKLM)) { New-Item -Path $tsKeyHKLM -Force | Out-Null }
-    Set-ItemProperty -Path $tsKeyHKLM -Name 'RedirectionWarningDialogVersion' -Value 1 -Type DWord -Force
-    Write-Log "Set RedirectionWarningDialogVersion = 1 (HKLM)." 'OK'
-
+    Force-DialogV2 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' 'HKLM'
     if ($UserSID) {
-        $tsKeyHKCU = "Registry::HKEY_USERS\$UserSID\Software\Policies\Microsoft\Windows NT\Terminal Services"
-        if (-not (Test-Path $tsKeyHKCU)) { New-Item -Path $tsKeyHKCU -Force | Out-Null }
-        Set-ItemProperty -Path $tsKeyHKCU -Name 'RedirectionWarningDialogVersion' -Value 1 -Type DWord -Force
-        Write-Log "Set RedirectionWarningDialogVersion = 1 (HKCU)." 'OK'
+        Force-DialogV2 "Registry::HKEY_USERS\$UserSID\Software\Policies\Microsoft\Windows NT\Terminal Services" 'HKCU'
     }
 
     Write-Log "---------------------------------------------"
-    Write-Log "Done. Cert removed, policy pruned, popup suppressed via registry bit."
-    Write-Log "If the vendor later signs their .rdp files, no further action needed here."
+    Write-Log "Done. CA removed, policy pruned, signatures stripped."
+    Write-Log "Security dialog left at version 2 (the mitigation). The popup stays. That is correct."
+    Write-Log "Real fix: vendor signs their .rdp files -> dialog shows a real publisher. Ticket is open."
     $exitCode = 0
 }
 catch {
