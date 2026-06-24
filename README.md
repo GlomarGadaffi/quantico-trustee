@@ -1,4 +1,4 @@
-# quantico-trustee
+# rdp-publisher-cert
 
 RDP file publisher for Windows. Microsoft decided your .rdp files needed a publisher — this tool provisions one. self-elevates to admin, generates or retrieves a self-signed certificate, signs all .rdp files on Desktop, configures Group Policy to trust the certificate, and sets up per-user consent bypass.
 
